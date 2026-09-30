@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Mini Chat</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="authScreen" class="screen">
+  <div class="authBox">
+    <h1>Mini Chat</h1>
+    <p class="subTitle">Simple private chatting</p>
+    <div id="loginBox">
+      <input id="loginId" type="text" inputmode="numeric" maxlength="5" placeholder="5-digit ID" autocomplete="username">
+      <input id="loginPassword" type="password" placeholder="Password" autocomplete="current-password">
+      <button id="loginBtn">Login</button>
+      <p id="loginMessage" class="message"></p>
+      <button id="showSignup" class="linkBtn">Create account</button>
+    </div>
+    <div id="signupBox" class="hidden">
+      <input id="signupName" type="text" maxlength="30" placeholder="Your name" autocomplete="name">
+      <input id="signupId" type="text" inputmode="numeric" maxlength="5" placeholder="Choose 5-digit ID" autocomplete="username">
+      <input id="signupPassword" type="password" placeholder="Password" autocomplete="new-password">
+      <input id="signupPasswordConfirm" type="password" placeholder="Confirm password" autocomplete="new-password">
+      <button id="signupBtn">Create Account</button>
+      <p id="signupMessage" class="message"></p>
+      <button id="showLogin" class="linkBtn">Back to login</button>
+    </div>
+  </div>
+</div>
+<div id="chatScreen" class="screen hidden">
+  <aside id="sidebar">
+    <header class="sideHeader">
+      <div class="profile">
+        <div id="myAvatar" class="avatar"></div>
+        <div>
+          <div id="myName" class="myName"></div>
+          <div id="myId" class="smallText"></div>
+        </div>
+      </div>
+      <button id="logoutBtn" class="logoutBtn">Logout</button>
+    </header>
+    <div class="searchBox">
+      <input id="searchInput" type="text" inputmode="numeric" maxlength="5" placeholder="Search 5-digit ID" autocomplete="off">
+      <button id="clearSearch" class="clearBtn">×</button>
+    </div>
+    <div id="searchResults" class="searchResults"></div>
+    <div class="recentHeader">
+      <span>Recent Chats</span>
+      <button id="clearRecent">Clear</button>
+    </div>
+    <div id="chatList"></div>
+    <div id="noRecent" class="emptyRecent">No recent chats</div>
+    <button id="deleteAccountBtn" class="deleteAccountBtn">Delete account</button>
+  </aside>
+  <main id="chatArea">
+    <div id="emptyChat" class="emptyChat">
+      <div class="emptyIcon">💬</div>
+      <h2>Mini Chat</h2>
+      <p>Search a 5-digit ID to start chatting.</p>
+    </div>
+    <section id="activeChat" class="activeChat hidden">
+      <header class="chatHeader">
+        <button id="backBtn" class="backBtn">‹</button>
+        <div id="chatAvatar" class="avatar"></div>
+        <div class="chatTitle">
+          <div id="chatUserName"></div>
+          <div id="chatUserId"></div>
+        </div>
+      </header>
+      <div id="messages" class="messages"></div>
+      <div class="inputArea">
+        <textarea id="messageInput" rows="1" maxlength="4000" placeholder="Type a message..."></textarea>
+        <button id="sendBtn" class="sendBtn">➤</button>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="dialog" class="dialog hidden">
+  <div class="dialogBox">
+    <p id="dialogText"></p>
+    <input id="dialogInput" class="hidden" type="password" placeholder="Password" autocomplete="current-password">
+    <p id="dialogError" class="message"></p>
+    <div class="dialogBtns">
+      <button id="dialogCancel">Cancel</button>
+      <button id="dialogOk">OK</button>
+    </div>
+  </div>
+</div>
+<div id="toast" class="toast hidden"></div>
+<script src="script.js" defer></script>
+</body>
+</html>
