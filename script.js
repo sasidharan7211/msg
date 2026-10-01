@@ -3,12 +3,15 @@ const POLL_OPEN = 2500; // while a chat is open
 const POLL_IDLE = 5000; // chat list only
 const MAX_SHOWN = 300;
 const $ = id => document.getElementById(id);
-let me = null, db = null, activeUser = null, searchTimer = null;
-let currentMessages = [], pending = [], lastHtml = "", lastJson = "", lastRecentHtml = "", chatLoaded = false;
+// Messages travel through Google Sheets; what you SEE (recent chats, unread, cached messages, hidden messages)
+// is kept in this phone's localStorage only. One account = one phone: a login elsewhere logs this phone out.
+let me = null, db = null, activeUser = null, searchTimer = null, serverTime = "";
+let lastChats = [], currentMessages = [], pending = [];
+let lastHtml = "", lastJson = "", lastRecentHtml = "", chatLoaded = false;
 let syncSeq = 0, appliedSeq = 0, sendQueue = Promise.resolve(), pollGen = 0, pollTimer = null, polling = false, firstSync = true, warned = false;
-const deleted = new Set();
+const deleted = new Set(); // ids removed locally, hidden until the server confirms
 /* ---------- helpers ---------- */
-const sid = v => String(v ?? "").padStart(5, "0"); // keeps leading zeros if backend returns numbers
+const sid = v => String(v ?? "").trim().padStart(5, "0"); // keeps leading zeros if backend returns numbers
 const cleanId = v => String(v || "").replace(/\D/g, "").slice(0, 5);
 const validId = id => /^\d{5}$/.test(id);
 const cleanName = n => String(n || "").trim().slice(0, 30);
@@ -119,34 +122,31 @@ async function api(action, data = {}, timeout = 25000) {
     clearTimeout(timer);
   }
   if (!result.success) {
-    if (result.code === "AUTH" && me) logout("Session expired. Please log in again.");
+    if (result.code === "AUTH" && me) logout(result.message || "Logged out. This account is open on another phone.");
     throw new Error(result.message || "Something went wrong");
   }
   return result;
 }
-/* ---------- storage ----------
-   Everything for one account lives in ONE localStorage key and in ONE in-memory object (db).
-   Screens read from memory (fast); writes are batched (max one write per 0.4 s).
-   Every localStorage call is wrapped, so a full/blocked storage can never break the app. */
-const DB_VERSION = 2;
+/* ---------- local storage (this phone only, one key per account, writes batched) ---------- */
+const DB_VERSION = 3;
 const dbKey = id => `miniChat:v${DB_VERSION}:${id}`;
 let saveTimer = null;
 function storageGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
 function storageSet(k, v) { try { localStorage.setItem(k, v); return true; } catch { return false; } }
 function storageRemove(k) { try { localStorage.removeItem(k); } catch {} }
-function loadDb(id) {
-  try { // remove data of the old storage format
-    Object.keys(localStorage).filter(k => k.startsWith(`miniChat_${id}`)).forEach(k => localStorage.removeItem(k));
+function loadDb(id, startTime) {
+  try { // remove data of older storage formats
+    Object.keys(localStorage).filter(k => k.startsWith(`miniChat_${id}`) || k === `miniChat:v2:${id}`).forEach(k => localStorage.removeItem(k));
   } catch {}
   let data = null;
   try { data = JSON.parse(storageGet(dbKey(id))); } catch {}
   data = data && typeof data === "object" ? data : {};
   return {
+    since: typeof data.since === "string" && data.since ? data.since : startTime || now(), // chats older than this were never seen on this phone
     recent: Array.isArray(data.recent) ? data.recent : [],
     unread: data.unread && typeof data.unread === "object" ? data.unread : {},
     hidden: data.hidden && typeof data.hidden === "object" ? data.hidden : {},
-    chats: data.chats && typeof data.chats === "object" ? data.chats : {},
-    cleared: typeof data.cleared === "string" ? data.cleared : ""
+    chats: data.chats && typeof data.chats === "object" ? data.chats : {}
   };
 }
 function saveDb() {
@@ -161,8 +161,7 @@ function flushDb() {
   const chats = {};
   Object.keys(db.chats).forEach(id => { if (keep.has(id)) chats[id] = db.chats[id].slice(-100); });
   db.chats = chats;
-  const text = JSON.stringify(db);
-  if (!storageSet(dbKey(me.id), text)) { // storage full: drop the message cache and try again
+  if (!storageSet(dbKey(me.id), JSON.stringify(db))) { // storage full: drop the message cache and try again
     db.chats = {};
     storageSet(dbKey(me.id), JSON.stringify(db));
   }
@@ -170,26 +169,97 @@ function flushDb() {
 window.addEventListener("pagehide", flushDb);
 document.addEventListener("visibilitychange", () => { if (document.hidden) flushDb(); });
 const hiddenOf = id => db.hidden[id] || [];
-function clearUnread(id) {
-  if (!db.unread[id]) return;
-  delete db.unread[id];
-  saveDb();
-}
 const totalUnread = () => Object.values(db.unread).reduce((a, b) => a + (Number(b) || 0), 0);
-function upsertRecent(user, patch = {}) {
-  const item = db.recent.find(u => u.id === user.id);
-  if (item) Object.assign(item, { name: user.name }, patch);
-  else db.recent.push({ id: user.id, name: user.name, lastTime: now(), preview: "", st: 0, ...patch });
-  db.recent.sort((a, b) => ts(b.lastTime) - ts(a.lastTime)); // newest message on top
-  db.recent.length = Math.min(db.recent.length, 30);
+/* ---------- recent chats (shown from this phone, refreshed from the sheet) ---------- */
+function renderRecent() {
+  const html = db.recent.map(u => {
+    const count = db.unread[u.id] || 0;
+    const cls = count > 0 ? " new" : "";
+    return `<div class="recentChat" data-id="${escapeHtml(u.id)}">
+      <div class="avatar">${escapeHtml(initial(u.name))}</div>
+      <div class="recentInfo">
+        <div class="recentTop"><div class="recentName">${escapeHtml(u.name)}</div><div class="recentTime${cls}">${formatTime(u.lastTime)}</div></div>
+        <div class="recentBottom"><div class="recentPreview${cls}">${tickHtml(u.st)}${escapeHtml(u.preview || "Open chat")}</div>${count > 0 ? `<div class="unread">${count > 99 ? "99+" : count}</div>` : ""}</div>
+      </div>
+    </div>`;
+  }).join("");
+  $("noRecent").classList.toggle("hidden", db.recent.length > 0);
+  const total = totalUnread();
+  document.title = total > 0 ? `(${total}) Mini Chat` : "Mini Chat";
+  if (html === lastRecentHtml) return; // nothing changed
+  lastRecentHtml = html;
+  $("chatList").innerHTML = html;
+}
+$("chatList").onclick = e => {
+  const row = e.target.closest(".recentChat");
+  const user = row && db.recent.find(u => u.id === row.dataset.id);
+  if (user) openChat(user);
+};
+$("clearRecent").onclick = () => dialog("Clear all chats from this phone?", {
+  okText: "Clear",
+  onOk: () => {
+    db.since = serverTime || now(); // older messages stay hidden on this phone
+    db.recent = [];
+    db.unread = {};
+    db.chats = {};
+    db.hidden = {};
+    lastChats = [];
+    pending = [];
+    currentMessages = [];
+    lastJson = lastHtml = "";
+    saveDb();
+    renderRecent();
+    renderMessages(true);
+  }
+});
+function applyChats(chats) {
+  lastChats = chats;
+  const since = ts(db.since);
+  const list = chats.filter(c => ts(c.time) > since).map(c => {
+    const id = sid(c.id);
+    const mine = sid(c.senderId) === me.id;
+    return {
+      id, name: c.name, lastTime: c.time, preview: decodeMessage(c.content) || "Message",
+      st: mine ? (c.seen ? 4 : c.delivered ? 3 : 2) : 0, unread: id === activeUser?.id ? 0 : Number(c.unread || 0)
+    };
+  });
+  pending.forEach(p => { // our own newer messages that the server copy does not have yet
+    let item = list.find(u => u.id === p.receiverId);
+    if (!item) {
+      const known = db.recent.find(u => u.id === p.receiverId) || (activeUser?.id === p.receiverId ? activeUser : null);
+      list.push(item = { id: p.receiverId, name: known ? known.name : p.receiverId, lastTime: "", preview: "", st: 0, unread: 0 });
+    }
+    if (ts(p.time) >= ts(item.lastTime)) Object.assign(item, { lastTime: p.time, preview: decodeMessage(p.content), st: p.sent ? 2 : 1 });
+  });
+  list.sort((a, b) => ts(b.lastTime) - ts(a.lastTime));
+  let incoming = false;
+  const counts = {};
+  list.forEach(u => {
+    if (u.unread > (db.unread[u.id] || 0)) incoming = true;
+    if (u.unread) counts[u.id] = u.unread;
+  });
+  db.unread = counts;
+  db.recent = list.slice(0, 30).map(({ unread: _, ...u }) => u);
+  const listed = new Set(list.map(u => u.id));
+  Object.keys(db.chats).forEach(id => { if (!listed.has(id) && id !== activeUser?.id) delete db.chats[id]; });
   saveDb();
+  renderRecent();
+  if (incoming && !firstSync) beep();
+  firstSync = false;
 }
 /* ---------- session ---------- */
-function enterApp(user) {
+function enterApp(user, startTime) {
   me = user;
-  db = loadDb(me.id);
+  db = loadDb(me.id, startTime);
   storageSet("miniChatUser", JSON.stringify(me));
-  openApp();
+  $("authScreen").classList.add("hidden");
+  $("chatScreen").classList.remove("hidden");
+  setText("myName", me.name);
+  setText("myId", me.id);
+  setText("myAvatar", initial(me.name));
+  showEmptyChat();
+  renderRecent();
+  startPolling();
 }
 function resetSession() {
   flushDb();
@@ -198,27 +268,35 @@ function resetSession() {
   me = null;
   db = null;
   activeUser = null;
+  lastChats = [];
   currentMessages = [];
   pending = [];
+  polling = false;
   deleted.clear();
   lastHtml = lastJson = lastRecentHtml = "";
+  chatLoaded = false;
   firstSync = true;
   document.title = "Mini Chat";
   storageRemove("miniChatUser");
 }
 function logout(message) {
   resetSession();
+  closeDialog();
   $("chatScreen").classList.add("hidden");
+  $("chatScreen").classList.remove("chatOpen");
   $("authScreen").classList.remove("hidden");
   $("loginPassword").value = "";
   showAuth(false);
   if (message) toast(message);
 }
-$("logoutBtn").onclick = () => logout();
+$("logoutBtn").onclick = () => {
+  if (me) api("logout", { userId: me.id }).catch(() => {}); // frees the session (request is built before the reset)
+  logout();
+};
 /* ---------- auth UI ---------- */
-function showAuth(signup) {
-  $("loginBox").classList.toggle("hidden", signup);
-  $("signupBox").classList.toggle("hidden", !signup);
+function showAuth(signupMode) {
+  $("loginBox").classList.toggle("hidden", signupMode);
+  $("signupBox").classList.toggle("hidden", !signupMode);
   setText("loginMessage", "");
   setText("signupMessage", "");
 }
@@ -229,7 +307,7 @@ function onEnter(ids, fn) {
 }
 async function startSession(id, password) {
   const result = await api("login", { id, password });
-  enterApp({ id: sid(result.user.id), name: result.user.name, token: result.token });
+  enterApp({ id: sid(result.user.id), name: result.user.name, token: result.token }, result.serverTime);
 }
 async function signup() {
   const name = cleanName($("signupName").value);
@@ -264,6 +342,7 @@ async function login() {
   try {
     $("loginBtn").disabled = true;
     await startSession(id, password);
+    $("loginPassword").value = "";
   } catch (e) {
     setText("loginMessage", e.message);
   } finally {
@@ -272,16 +351,6 @@ async function login() {
 }
 $("loginBtn").onclick = login;
 onEnter(["loginId", "loginPassword"], login);
-function openApp() {
-  $("authScreen").classList.add("hidden");
-  $("chatScreen").classList.remove("hidden");
-  setText("myName", me.name);
-  setText("myId", me.id);
-  setText("myAvatar", initial(me.name));
-  showEmptyChat();
-  renderRecent();
-  startPolling();
-}
 /* ---------- search ---------- */
 $("searchInput").addEventListener("input", () => {
   clearTimeout(searchTimer);
@@ -300,7 +369,7 @@ async function searchUser(id) {
   const info = text => box.innerHTML = `<div class="emptyRecent">${escapeHtml(text)}</div>`;
   try {
     const { user } = await api("searchUser", { id, userId: me.id });
-    if (!me || $("searchInput").value !== id) return; // input changed while waiting
+    if (!me || $("searchInput").value !== id) return; // logged out, or input changed while waiting
     if (!user) return info("User not found");
     const found = { id: sid(user.id), name: user.name };
     if (found.id === me.id) return info("This is your ID");
@@ -314,76 +383,14 @@ async function searchUser(id) {
       $("searchInput").value = "";
     };
   } catch (e) {
-    info(e.message);
+    if (me) info(e.message);
   }
-}
-/* ---------- recent chats (newest on top, unread badge like WhatsApp) ---------- */
-function renderRecent() {
-  const html = db.recent.map(u => {
-    const count = db.unread[u.id] || 0;
-    const cls = count > 0 ? " new" : "";
-    return `<div class="recentChat" data-id="${escapeHtml(u.id)}">
-      <div class="avatar">${escapeHtml(initial(u.name))}</div>
-      <div class="recentInfo">
-        <div class="recentTop"><div class="recentName">${escapeHtml(u.name)}</div><div class="recentTime${cls}">${formatTime(u.lastTime)}</div></div>
-        <div class="recentBottom"><div class="recentPreview${cls}">${tickHtml(u.st)}${escapeHtml(u.preview || "Open chat")}</div>${count > 0 ? `<div class="unread">${count > 99 ? "99+" : count}</div>` : ""}</div>
-      </div>
-    </div>`;
-  }).join("");
-  $("noRecent").classList.toggle("hidden", db.recent.length > 0);
-  const total = totalUnread();
-  document.title = total > 0 ? `(${total}) Mini Chat` : "Mini Chat";
-  if (html === lastRecentHtml) return; // nothing changed
-  lastRecentHtml = html;
-  $("chatList").innerHTML = html;
-}
-$("chatList").onclick = e => {
-  const row = e.target.closest(".recentChat");
-  const user = row && db.recent.find(u => u.id === row.dataset.id);
-  if (user) openChat(user);
-};
-$("clearRecent").onclick = () => dialog("Clear recent chats from this device?", {
-  okText: "Clear",
-  onOk: () => {
-    db.cleared = now(); // stops the next sync from re-adding old chats
-    db.recent = [];
-    db.unread = {};
-    db.chats = {};
-    saveDb();
-    renderRecent();
-  }
-});
-function applyChats(chats) {
-  const cleared = ts(db.cleared);
-  let incoming = false;
-  chats.forEach(chat => {
-    if (ts(chat.time) <= cleared) return;
-    const id = sid(chat.id);
-    if (pending.some(p => p.receiverId === id)) return; // our own message is newer than the server copy
-    const st = sid(chat.senderId) === me.id ? (chat.seen ? 4 : chat.delivered ? 3 : 2) : 0;
-    upsertRecent({ id, name: chat.name }, { lastTime: chat.time, preview: decodeMessage(chat.content) || "Message", st });
-    const count = id === activeUser?.id ? 0 : Number(chat.unread || 0);
-    if (count > (db.unread[id] || 0)) incoming = true;
-    if (count) db.unread[id] = count;
-    else delete db.unread[id];
-  });
-  const listed = new Set(chats.map(c => sid(c.id)));
-  db.recent = db.recent.filter(u => {
-    if (listed.has(u.id) || pending.some(p => p.receiverId === u.id)) return true;
-    delete db.chats[u.id]; // gone from the server, so gone from this device
-    delete db.hidden[u.id];
-    delete db.unread[u.id];
-    return false;
-  });
-  saveDb();
-  renderRecent();
-  if (incoming && !firstSync) beep();
-  firstSync = false;
 }
 /* ---------- open / close chat ---------- */
 function openChat(user) {
   activeUser = { id: user.id, name: user.name };
-  clearUnread(user.id);
+  delete db.unread[user.id];
+  saveDb();
   renderRecent();
   $("chatScreen").classList.add("chatOpen");
   $("emptyChat").classList.add("hidden");
@@ -391,16 +398,20 @@ function openChat(user) {
   setText("chatUserName", user.name);
   setText("chatUserId", user.id);
   setText("chatAvatar", initial(user.name));
-  lastHtml = "";
+  lastHtml = lastJson = "";
   chatLoaded = false;
   currentMessages = db.chats[user.id] || [];
   lastJson = JSON.stringify(currentMessages);
   renderMessages(true); // cached messages show instantly
-  sync(true).catch(syncError);
+  poll(true); // load this chat right away
+  clearTimeout(pollTimer);
+  startPolling();
   if (matchMedia("(pointer: fine)").matches) setTimeout(() => $("messageInput").focus(), 100); // mouse devices only, so phones do not open the keypad
 }
 function showEmptyChat() {
   activeUser = null;
+  currentMessages = [];
+  lastHtml = lastJson = "";
   $("chatScreen").classList.remove("chatOpen");
   $("activeChat").classList.add("hidden");
   $("emptyChat").classList.remove("hidden");
@@ -414,44 +425,36 @@ async function sync(scroll = false) {
   const result = await api("sync", { userId: me.id, otherId: other });
   if (!me || seq < appliedSeq) return; // logged out, or an older reply arrived late
   appliedSeq = seq;
+  serverTime = result.serverTime || serverTime;
   pending = pending.filter(p => !(p.sent && seq > p.sentSeq)); // this sync started after the send finished, so the server copy is in the reply
   applyChats(result.chats || []);
-  if (other && activeUser?.id === other) applyMessages(other, result.messages || [], scroll);
+  if (other && activeUser?.id === other) applyMessages(result.messages || [], scroll);
 }
-function applyMessages(other, raw, scroll) {
+function applyMessages(raw, scroll) {
   const messages = raw
     .map(m => ({ ...m, senderId: sid(m.senderId), receiverId: sid(m.receiverId) }))
-    .filter(m => !deleted.has(m.messageId));
+    .filter(m => !deleted.has(m.messageId) && ts(m.time) > ts(db.since));
   const json = JSON.stringify(messages);
   if (json !== lastJson) {
     const received = list => list.filter(m => m.senderId !== me.id).length;
     if (chatLoaded && received(messages) > received(currentMessages)) beep();
     lastJson = json;
     currentMessages = messages;
-    db.chats[other] = messages;
-    if (messages.length < 300 && db.hidden[other]) { // full history received: forget hidden ids of deleted messages
-      const ids = new Set(messages.map(m => m.messageId));
-      db.hidden[other] = db.hidden[other].filter(id => ids.has(id));
-      if (!db.hidden[other].length) delete db.hidden[other];
-    }
-    const shown = view().pop();
-    if (shown) upsertRecent(activeUser, { lastTime: shown.time, preview: decodeMessage(shown.content) || "Message", st: stateOf(shown) });
-    clearUnread(other);
+    db.chats[activeUser.id] = messages;
     saveDb();
-    renderRecent();
   }
   chatLoaded = true;
-  renderMessages(scroll);
+  renderMessages(scroll || !lastHtml);
 }
 /* ---------- messages ---------- */
 // server messages + our own messages that the server has not returned yet
 function view() {
   const ids = new Set(currentMessages.map(m => m.messageId));
-  return [...currentMessages, ...pending.filter(p => p.receiverId === activeUser.id && !ids.has(p.messageId))];
+  return [...currentMessages, ...pending.filter(p => p.receiverId === activeUser.id && !ids.has(p.messageId) && !deleted.has(p.messageId))];
 }
 function renderMessages(scroll = false) {
-  if (!activeUser) return;
   const box = $("messages");
+  if (!activeUser) return;
   const hidden = hiddenOf(activeUser.id);
   let day = "";
   const html = view().filter(m => !(m.receiverId === me.id && hidden.includes(m.messageId))).slice(-MAX_SHOWN).map(m => {
@@ -481,17 +484,17 @@ $("messages").onclick = e => {
 };
 function deleteMessage(message) {
   const chatId = activeUser.id;
-  if (message.senderId === me.id) {
+  if (message.senderId === me.id) { // delete for everyone: removed from the sheet
     return dialog("Delete this message for everyone?", {
       okText: "Delete",
       onOk: () => {
         deleted.add(message.messageId);
         currentMessages = currentMessages.filter(m => m.messageId !== message.messageId);
         pending = pending.filter(p => p.messageId !== message.messageId);
-        if (db.chats[chatId]) db.chats[chatId] = currentMessages;
+        db.chats[chatId] = currentMessages;
         lastJson = "";
         saveDb();
-        if (activeUser?.id === chatId) renderMessages(); // disappears instantly, server catches up in the background
+        renderMessages(); // disappears instantly, the sheet catches up in the background
         api("deleteMessage", { userId: me.id, messageId: message.messageId }).catch(e => {
           deleted.delete(message.messageId);
           toast(e.message);
@@ -499,12 +502,12 @@ function deleteMessage(message) {
       }
     });
   }
-  dialog("Delete this message for you?", {
+  dialog("Delete this message for you?", { // delete for me: this phone only
     okText: "Delete",
     onOk: () => {
       db.hidden[chatId] = [...hiddenOf(chatId).filter(id => id !== message.messageId), message.messageId].slice(-500);
       saveDb();
-      if (activeUser?.id === chatId) renderMessages();
+      renderMessages();
     }
   });
 }
@@ -532,8 +535,7 @@ function sendMessage() {
   resizeInput();
   pending.push(msg); // shown at once with a clock, becomes ✓ when the server confirms
   renderMessages(true);
-  upsertRecent(target, { lastTime: msg.time, preview: text, st: 1 });
-  renderRecent();
+  applyChats(lastChats);
   // messages go out one after another so their order never gets mixed up
   sendQueue = sendQueue.then(async () => {
     if (!me) return;
@@ -543,7 +545,6 @@ function sendMessage() {
       msg.time = result.time || msg.time;
       msg.sent = true;
       msg.sentSeq = syncSeq;
-      upsertRecent(target, { lastTime: msg.time, st: 2 });
     } catch (e) {
       if (!me) return;
       pending = pending.filter(p => p !== msg);
@@ -551,8 +552,8 @@ function sendMessage() {
       if (!input.value) { input.value = text; resizeInput(); }
     }
     if (me) {
-      renderRecent();
       renderMessages();
+      applyChats(lastChats);
     }
   });
 }
@@ -567,11 +568,9 @@ $("deleteAccountBtn").onclick = () => dialog("Enter your password to permanently
     } catch (e) {
       return e.message;
     }
-    pollGen++;
-    storageRemove(dbKey(me.id));
-    storageRemove("miniChatUser");
-    me = null; // nothing may be saved again
-    db = null;
+    const key = dbKey(me.id);
+    resetSession();
+    storageRemove(key);
     toast("Account deleted.");
     setTimeout(() => location.reload(), 1200);
   }
@@ -584,10 +583,10 @@ function syncError(e) {
     toast("Backend is outdated: paste the new Code.gs and deploy a NEW version.");
   }
 }
-async function poll() {
+async function poll(scroll = false) {
   if (!me || polling) return;
   polling = true;
-  try { await sync(); } catch (e) { syncError(e); } finally { polling = false; }
+  try { await sync(scroll); } catch (e) { syncError(e); } finally { polling = false; }
 }
 function startPolling() {
   const gen = ++pollGen;
@@ -599,7 +598,7 @@ function startPolling() {
   })();
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
-/* ---------- restore login ---------- */
+/* ---------- restore login (this phone keeps its session until another phone logs in) ---------- */
 (function restoreLogin() {
   try {
     const saved = JSON.parse(storageGet("miniChatUser"));
